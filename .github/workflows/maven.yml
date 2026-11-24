@@ -15,7 +15,13 @@
 
 name: Java CI
 
-on: [push, pull_request]
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional surefire -Dtest selector; empty runs the full suite'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -24,20 +30,17 @@ jobs:
   build:
 
     runs-on: ubuntu-latest
-    continue-on-error: ${{ matrix.experimental }}
+    timeout-minutes: 45
     strategy:
+      fail-fast: false
       matrix:
-        java: [ 8, 11, 17, 21 ]
-        experimental: [false]
-        include:
-          - java: 22-ea
-            experimental: true
-        
+        java: [ 8, 11, 17, 21, 22 ]
+
     steps:
     - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # 4.1.1
       with:
         persist-credentials: false
-    - uses: actions/cache@13aacd865c20de90d75de3b17ebe84f7a17d57d2 # v4.0.0
+    - uses: actions/cache@v4
       with:
         path: ~/.m2/repository
         key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
@@ -49,4 +52,74 @@ jobs:
         distribution: 'temurin'
         java-version: ${{ matrix.java }}
     - name: Build with Maven
-      run: mvn --show-version --batch-mode --no-transfer-progress
+      env:
+        # Base64Test.testCodec265 skips itself unless the JVM can allocate ~5.3 GiB
+        _JAVA_OPTIONS: -Xmx10g
+      run: |
+        GATES="-Drat.skip=true -Dcheckstyle.skip=true -Djapicmp.skip=true -Danimal.sniffer.skip=true -Djacoco.skip=true -Dspotbugs.skip=true -Dpmd.skip=true -Dcpd.skip=true"
+        if [ -n "${{ inputs.test-filter }}" ]; then
+          mvn --errors --show-version --batch-mode --no-transfer-progress clean verify $GATES -Dsurefire.failIfNoSpecifiedTests=false -Dtest=${{ inputs.test-filter }}
+        else
+          mvn --errors --show-version --batch-mode --no-transfer-progress clean verify $GATES
+        fi
+    - name: List skipped tests with reasons
+      if: always()
+      run: |
+        mkdir -p /tmp/probe
+        cat > /tmp/probe/Probe.java <<'JEOF'
+        import org.apache.commons.codec.digest.*;
+        public class Probe {
+          public static void main(String[] a) {
+            String[] v = MessageDigestAlgorithms.values();
+            for (int i = 0; i < v.length; i++) System.out.println("MD\t" + (i + 1) + "\t" + v[i] + "\t" + DigestUtils.isAvailable(v[i]));
+          }
+        }
+        JEOF
+        javac -cp target/classes -d /tmp/probe /tmp/probe/Probe.java && java -cp target/classes:/tmp/probe Probe > /tmp/probe/out.txt
+        python3 - <<'PYEOF'
+        import glob, re, xml.etree.ElementTree as ET
+        md = {}
+        try:
+            for line in open('/tmp/probe/out.txt'):
+                _, idx, alg, ok = line.rstrip('\n').split('\t')
+                md[idx] = (alg, ok)
+        except OSError:
+            pass
+        total = tests = fails = errs = 0
+        for f in sorted(glob.glob('target/surefire-reports/TEST-*.xml')):
+            r = ET.parse(f).getroot()
+            tests += int(r.get('tests', 0)); fails += int(r.get('failures', 0)); errs += int(r.get('errors', 0))
+            for tc in r.iter('testcase'):
+                sk = tc.find('skipped')
+                if sk is None:
+                    continue
+                total += 1
+                msg = (sk.get('message') or '').splitlines()
+                first = msg[0] if msg else '(no message)'
+                cls, name = tc.get('classname'), tc.get('name')
+                cause = ''
+                if cls.endswith('.DigestUtilsTest'):
+                    alg = {'testSha512_224': 'SHA-512/224', 'testSha512_256': 'SHA-512/256'}.get(name)
+                    if alg is None and name.startswith('testSha3_'):
+                        alg = 'SHA3-' + name[len('testSha3_'):].split('Hex')[0]
+                    avail = {v[0]: v[1] for v in md.values()}.get(alg, 'unknown')
+                    cause = 'test calls assumeJava9() (JUnit assumeTrue(SystemUtils.isJavaVersionAtLeast(JAVA_9))); %s digest is a JDK 9+ algorithm, DigestUtils.isAvailable(%s)=%s on this JDK' % (alg, alg, avail)
+                elif cls.endswith('MessageDigestAlgorithmsTest'):
+                    m = re.search(r'\[(\d+)\]', name)
+                    if m and m.group(1) in md:
+                        alg, ok = md[m.group(1)]
+                        cause = 'parameter %s = %s, DigestUtils.isAvailable=%s on this JDK' % (m.group(1), alg, ok)
+                elif cls.endswith('PercentCodecTest'):
+                    cause = 'annotated @Disabled upstream ("TODO Should be removed?")'
+                print('SKIPPED: %s.%s -- %s%s' % (cls, name, first, (' -- cause: ' + cause) if cause else ''))
+        print('SUREFIRE SUMMARY: tests=%d failures=%d errors=%d skipped=%d passed=%d' % (tests, fails, errs, total, tests - fails - errs - total))
+        PYEOF
+    - name: Upload jars
+      if: matrix.java == 21
+      uses: actions/upload-artifact@v4
+      with:
+        name: commons-codec-jars
+        path: |
+          target/commons-codec-1.16.1.jar
+          target/commons-codec-1.16.1-tests.jar
+        if-no-files-found: error
